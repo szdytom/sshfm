@@ -513,8 +513,10 @@ static std::vector<std::string> u8wrap(const std::string &s, int w)
 	return out;
 }
 
-/* Editor wrap: full width `w` on every visual row except the last row of each
- * logical line, which uses w-1 so one column remains after the last character. */
+/* Editor wrap within one logical line: intermediate rows use full width `w`;
+ * the final row holds at most w-1 columns of text so one column remains for
+ * the cursor after the last character.  If the tail would fit in w columns
+ * but not w-1, force a break at w-1 (last grapheme(s) move to the next row). */
 static int editor_chunk_limit(const std::string &s, size_t pos, int w)
 {
 	if (w < 1)
@@ -523,7 +525,11 @@ static int editor_chunk_limit(const std::string &s, size_t pos, int w)
 	if (w_last < 1)
 		w_last = 1;
 	int rem = u8width(s.substr(pos));
-	return (rem <= w_last) ? w_last : w;
+	if (rem <= w_last)
+		return w_last;
+	if (rem <= w)
+		return w_last;   /* would fill the row with no cursor column left */
+	return w;
 }
 
 static std::vector<std::string> u8wrap_edit(const std::string &s, int w)
@@ -576,7 +582,6 @@ static void cursor_chunk_edit(const std::string &s, int cx, int w, int &chunk,
 			return;
 		}
 		if (cx == end) {
-			/* end of a non-final wrap row: cursor uses the next row, col 0 */
 			if (c + 1 < (int)chunks.size()) {
 				chunk = c + 1;
 				col = 0;
@@ -591,9 +596,6 @@ static void cursor_chunk_edit(const std::string &s, int cx, int w, int &chunk,
 	if (!chunks.empty()) {
 		chunk = (int)chunks.size() - 1;
 		col = u8width(chunks.back());
-	} else {
-		chunk = 0;
-		col = 0;
 	}
 }
 
