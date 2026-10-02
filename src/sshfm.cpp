@@ -517,18 +517,17 @@ static std::vector<std::string> u8wrap(const std::string &s, int w)
  * the final row holds at most w-1 columns of text so one column remains for
  * the cursor after the last character.  If the tail would fit in w columns
  * but not w-1, force a break at w-1 (last grapheme(s) move to the next row). */
-static int editor_chunk_limit(const std::string &s, size_t pos, int w)
+static int editor_limit_for_rem(int rem, int w)
 {
 	if (w < 1)
 		w = 1;
 	int w_last = w - 1;
 	if (w_last < 1)
 		w_last = 1;
-	int rem = u8width(s.substr(pos));
 	if (rem <= w_last)
 		return w_last;
 	if (rem <= w)
-		return w_last;   /* would fill the row with no cursor column left */
+		return w_last;
 	return w;
 }
 
@@ -537,42 +536,49 @@ static std::vector<std::string> u8wrap_edit(const std::string &s, int w)
 	std::vector<std::string> out;
 	if (w < 1)
 		w = 1;
-	/* every logical line gets at least one visual row (including blank lines) */
 	if (s.empty()) {
 		out.push_back("");
 		return out;
 	}
-	size_t pos = 0;
-	while (pos < s.size()) {
-		int limit = editor_chunk_limit(s, pos, w);
-		std::string cur;
+	struct Cluster {
+		size_t b, e;
+		int cw;
+	};
+	std::vector<Cluster> cl;
+	for (size_t i = 0; i < s.size();) {
+		size_t j = next_cluster(s, i);
+		cl.push_back({i, j, cluster_width(s, i, j)});
+		i = j;
+	}
+	int n = (int)cl.size();
+	std::vector<int> suf(n + 1);
+	suf[n] = 0;
+	for (int k = n - 1; k >= 0; k--)
+		suf[k] = suf[k + 1] + cl[k].cw;
+	int k = 0;
+	while (k < n) {
+		int limit = editor_limit_for_rem(suf[k], w);
 		int cw = 0;
-		size_t i = pos;
-		while (i < s.size()) {
-			size_t j = next_cluster(s, i);
-			int clw = cluster_width(s, i, j);
-			if (cw + clw > limit && !cur.empty())
+		int k0 = k;
+		while (k < n) {
+			if (cw + cl[k].cw > limit && cw > 0)
 				break;
-			cur.append(s, i, j - i);
-			cw += clw;
-			i = j;
+			cw += cl[k].cw;
+			k++;
 		}
-		out.push_back(cur);
-		pos = i;
+		out.push_back(s.substr(cl[k0].b, cl[k].b - cl[k0].b));
 	}
 	if (out.empty())
 		out.push_back("");
 	return out;
 }
 
-static void cursor_chunk_edit(const std::string &s, int cx, int w, int &chunk,
-                              int &col)
+static void cursor_chunk_from_chunks(const std::string &s, int cx,
+                                     const std::vector<std::string> &chunks,
+                                     int &chunk, int &col)
 {
 	chunk = 0;
 	col = 0;
-	if (w < 1)
-		w = 1;
-	std::vector<std::string> chunks = u8wrap_edit(s, w);
 	int off = 0;
 	for (int c = 0; c < (int)chunks.size(); c++) {
 		int end = off + (int)chunks[c].size();
@@ -599,39 +605,39 @@ static void cursor_chunk_edit(const std::string &s, int cx, int w, int &chunk,
 	}
 }
 
+static void cursor_chunk_edit(const std::string &s, int cx, int w, int &chunk,
+                              int &col)
+{
+	if (w < 1)
+		w = 1;
+	cursor_chunk_from_chunks(s, cx, u8wrap_edit(s, w), chunk, col);
+}
+
 static size_t chunk_byte_offset_edit(const std::string &s, int chunk_want,
                                      int col_want, int w)
 {
 	if (w < 1)
 		w = 1;
-	int chunk = 0;
-	size_t pos = 0;
-	while (pos < s.size()) {
-		int limit = editor_chunk_limit(s, pos, w);
-		int col = 0;
-		size_t i = pos;
-		while (i < s.size()) {
-			size_t j = next_cluster(s, i);
-			int clw = cluster_width(s, i, j);
-			if (col + clw > limit && col > 0) {
-				if (chunk == chunk_want && col_want >= col)
-					return i;   /* past this full row -> next row, col 0 */
-				break;
+	std::vector<std::string> chunks = u8wrap_edit(s, w);
+	int off = 0;
+	for (int c = 0; c < (int)chunks.size(); c++) {
+		if (c == chunk_want) {
+			int cw = 0;
+			size_t i = (size_t)off;
+			size_t end = (size_t)off + chunks[c].size();
+			while (i < end) {
+				size_t j = next_cluster(s, i);
+				int clw = cluster_width(s, i, j);
+				if (cw + clw > col_want)
+					return i;
+				cw += clw;
+				i = j;
 			}
-			if (chunk > chunk_want)
-				return i;
-			if (chunk == chunk_want && col + clw > col_want)
-				return i;
-			col += clw;
-			i = j;
+			if (col_want >= cw && c + 1 < (int)chunks.size())
+				return end;
+			return end;
 		}
-		if (chunk == chunk_want) {
-			if (col_want >= col && i < s.size())
-				return i;       /* goal past end of a full intermediate row */
-			return i;
-		}
-		chunk++;
-		pos = i;
+		off += (int)chunks[c].size();
 	}
 	return s.size();
 }
@@ -1654,7 +1660,13 @@ private:
 	void editor_invalidate_wrap();
 	void editor_sync_wrap();
 	void editor_touch_line(int li);
+	void editor_append_disp_line(int li);
+	void editor_patch_disp_line(int li);
+	void editor_rebuild_disp_all();
+	void editor_rebuild_disp_from_line(int from_li);
 	void editor_after_lines_change(int li, bool restructure);
+	void editor_insert_text(const std::string &ins);
+	void editor_drain_paste(std::string &ins);
 	const std::vector<std::pair<int, int>> &editor_display(); /* (logical, chunkstart) */
 	int editor_cursor_display_row() const;
 	int editor_total_display_rows() const;
@@ -2143,8 +2155,10 @@ std::string UI::editor_lock_holder_ip() const
 	std::string name = (p == std::string::npos) ? edit_rel_ : edit_rel_.substr(p + 1);
 	std::string lid = filelock_entry_id(m.id, name);
 	unsigned long long owner = 0;
-	if (!filelock_owner_id(lid, owner) || owner == sid_)
+	if (!filelock_owner_id(lid, owner))
 		return std::string();
+	if (owner == sid_)
+		return "you";
 	return session_ip(owner);
 }
 
@@ -2322,14 +2336,109 @@ void UI::editor_invalidate_wrap()
 void UI::editor_sync_wrap()
 {
 	int w = editor_text_w();
-	if (w != editor_wrap_w_ ||
-	    editor_wrap_.size() != (size_t)editor_line_count()) {
+	if (w != editor_wrap_w_) {
 		editor_wrap_w_ = w;
 		editor_wrap_.resize(lines_.size());
 		for (int li = 0; li < editor_line_count(); li++)
 			editor_wrap_[li] = u8wrap_edit(lines_[li], w);
 		editor_disp_dirty_ = true;
+		return;
 	}
+	if (editor_wrap_.size() == (size_t)editor_line_count())
+		return;
+	int old_n = (int)editor_wrap_.size();
+	editor_wrap_.resize(lines_.size());
+	for (int li = old_n; li < editor_line_count(); li++)
+		editor_wrap_[li] = u8wrap_edit(lines_[li], w);
+	if (editor_line_count() < old_n)
+		editor_rebuild_disp_from_line(0);
+	else if (old_n < editor_line_count())
+		editor_rebuild_disp_from_line(old_n);
+}
+
+void UI::editor_append_disp_line(int li)
+{
+	if (li < 0 || li >= (int)editor_wrap_.size())
+		return;
+	const std::vector<std::string> &chunks = editor_wrap_[li];
+	if (chunks.empty()) {
+		editor_disp_.push_back({li, 0});
+		return;
+	}
+	size_t off = 0;
+	for (const std::string &chunk : chunks) {
+		editor_disp_.push_back({li, (int)off});
+		off += chunk.size();
+	}
+}
+
+void UI::editor_rebuild_disp_all()
+{
+	editor_disp_.clear();
+	for (int li = 0; li < editor_line_count(); li++)
+		editor_append_disp_line(li);
+	editor_disp_dirty_ = false;
+}
+
+void UI::editor_rebuild_disp_from_line(int from_li)
+{
+	if (from_li < 0)
+		from_li = 0;
+	size_t cut = editor_disp_.size();
+	for (size_t i = 0; i < editor_disp_.size(); i++) {
+		if (editor_disp_[i].first >= from_li) {
+			cut = i;
+			break;
+		}
+	}
+	editor_disp_.erase(editor_disp_.begin() + (ptrdiff_t)cut,
+	                   editor_disp_.end());
+	for (int li = from_li; li < editor_line_count(); li++)
+		editor_append_disp_line(li);
+	editor_disp_dirty_ = false;
+}
+
+void UI::editor_patch_disp_line(int li)
+{
+	if (li < 0 || li >= editor_line_count())
+		return;
+	size_t begin = editor_disp_.size();
+	for (size_t i = 0; i < editor_disp_.size(); i++) {
+		if (editor_disp_[i].first == li) {
+			begin = i;
+			break;
+		}
+		if (editor_disp_[i].first > li) {
+			begin = i;
+			break;
+		}
+	}
+	if (begin == editor_disp_.size()) {
+		for (size_t i = 0; i < editor_disp_.size(); i++)
+			if (editor_disp_[i].first < li)
+				begin = i + 1;
+	}
+	size_t end = begin;
+	while (end < editor_disp_.size() && editor_disp_[end].first == li)
+		end++;
+	std::vector<std::pair<int, int>> patch;
+	if (li < (int)editor_wrap_.size()) {
+		const std::vector<std::string> &chunks = editor_wrap_[li];
+		if (chunks.empty())
+			patch.push_back({li, 0});
+		else {
+			size_t off = 0;
+			for (const std::string &chunk : chunks) {
+				patch.push_back({li, (int)off});
+				off += chunk.size();
+			}
+		}
+	}
+	editor_disp_.erase(editor_disp_.begin() + (ptrdiff_t)begin,
+	                   editor_disp_.begin() + (ptrdiff_t)end);
+	editor_disp_.insert(editor_disp_.begin() + (ptrdiff_t)begin,
+	                    patch.begin(), patch.end());
+	editor_disp_dirty_ = false;
 }
 
 void UI::editor_touch_line(int li)
@@ -2338,15 +2447,100 @@ void UI::editor_touch_line(int li)
 		return;
 	editor_sync_wrap();
 	editor_wrap_[li] = u8wrap_edit(lines_[li], editor_wrap_w_);
-	editor_disp_dirty_ = true;
+	if (editor_disp_dirty_ || editor_disp_.empty())
+		editor_rebuild_disp_all();
+	else
+		editor_patch_disp_line(li);
 }
 
 void UI::editor_after_lines_change(int li, bool restructure)
 {
-	if (restructure)
-		editor_invalidate_wrap();
-	else
+	if (restructure) {
+		if (editor_text_w() != editor_wrap_w_) {
+			editor_invalidate_wrap();
+			editor_sync_wrap();
+			return;
+		}
+		editor_sync_wrap();
+		for (int i = li; i < editor_line_count(); i++)
+			editor_wrap_[i] = u8wrap_edit(lines_[i], editor_wrap_w_);
+		if (editor_disp_dirty_ || editor_disp_.empty())
+			editor_rebuild_disp_all();
+		else
+			editor_rebuild_disp_from_line(li);
+	} else {
 		editor_touch_line(li);
+	}
+}
+
+static bool editor_paste_byte(unsigned char c)
+{
+	if (c == 0x1b)
+		return false;
+	if (c == 0x7f || c == 0x08 || c == 0x0d || c == 0x0a || c == 0x09)
+		return false;
+	if (c < 0x20 && c != 0)
+		return false;
+	return true;
+}
+
+void UI::editor_drain_paste(std::string &ins)
+{
+	for (;;) {
+		while (!inbuf_.empty()) {
+			unsigned char c = (unsigned char)inbuf_[0];
+			if (!editor_paste_byte(c))
+				return;
+			int sl = u8seqlen(c);
+			if ((int)inbuf_.size() < sl) {
+				char b[4096];
+				int n = ssh_channel_read_timeout(ch_, b, sizeof(b), 0, 0);
+				if (n > 0)
+					inbuf_.append(b, (size_t)n);
+				if ((int)inbuf_.size() < sl)
+					return;
+			}
+			ins += inbuf_.substr(0, (size_t)sl);
+			inbuf_.erase(0, (size_t)sl);
+		}
+		char b[4096];
+		int n = ssh_channel_read_timeout(ch_, b, sizeof(b), 0, 0);
+		if (n <= 0)
+			return;
+		inbuf_.append(b, (size_t)n);
+	}
+}
+
+void UI::editor_insert_text(const std::string &ins)
+{
+	if (ins.empty())
+		return;
+	bool restructure = false;
+	int first_li = cy_;
+	size_t pos = 0;
+	while (pos <= ins.size()) {
+		size_t nl = ins.find('\n', pos);
+		std::string part = (nl == std::string::npos)
+		                       ? ins.substr(pos)
+		                       : ins.substr(pos, nl - pos);
+		if (!part.empty()) {
+			lines_[cy_].insert((size_t)cx_, part);
+			cx_ += (int)part.size();
+		}
+		if (nl == std::string::npos)
+			break;
+		std::string rest = lines_[cy_].substr((size_t)cx_);
+		lines_[cy_].erase((size_t)cx_);
+		lines_.insert(lines_.begin() + cy_ + 1, rest);
+		cy_++;
+		cx_ = 0;
+		restructure = true;
+		pos = nl + 1;
+	}
+	if (restructure)
+		editor_after_lines_change(first_li, true);
+	else
+		editor_touch_line(first_li);
 }
 
 int UI::editor_total_display_rows() const
@@ -2359,12 +2553,13 @@ int UI::editor_total_display_rows() const
 
 int UI::editor_cursor_display_row() const
 {
-	int w = editor_text_w();
 	int d = 0;
 	for (int li = 0; li < cy_; li++)
 		d += (int)editor_wrap_[li].size();
+	if (cy_ < 0 || cy_ >= (int)editor_wrap_.size())
+		return d;
 	int chunk = 0, col = 0;
-	cursor_chunk_edit(lines_[cy_], cx_, w, chunk, col);
+	cursor_chunk_from_chunks(lines_[cy_], cx_, editor_wrap_[cy_], chunk, col);
 	(void)col;
 	return d + chunk;
 }
@@ -2372,22 +2567,8 @@ int UI::editor_cursor_display_row() const
 const std::vector<std::pair<int, int>> &UI::editor_display()
 {
 	editor_sync_wrap();
-	if (!editor_disp_dirty_)
-		return editor_disp_;
-	editor_disp_.clear();
-	for (int li = 0; li < editor_line_count(); li++) {
-		const std::vector<std::string> &chunks = editor_wrap_[li];
-		if (chunks.empty()) {
-			editor_disp_.push_back({li, 0});
-			continue;
-		}
-		size_t off = 0;
-		for (const std::string &chunk : chunks) {
-			editor_disp_.push_back({li, (int)off});
-			off += chunk.size();
-		}
-	}
-	editor_disp_dirty_ = false;
+	if (editor_disp_dirty_ || editor_disp_.empty())
+		editor_rebuild_disp_all();
 	return editor_disp_;
 }
 
@@ -2690,7 +2871,9 @@ void UI::render()
 		int numw = main_cols_ - w;
 		int cdisp = editor_cursor_display_row();
 		int chunk = 0, col = 0;
-		cursor_chunk_edit(lines_[cy_], cx_, w, chunk, col);
+		if (cy_ >= 0 && cy_ < (int)editor_wrap_.size())
+			cursor_chunk_from_chunks(lines_[cy_], cx_, editor_wrap_[cy_],
+			                          chunk, col);
 		(void)chunk;
 		int ccol = numw + col;
 		if (ccol < 0) ccol = 0;
@@ -3242,19 +3425,26 @@ bool UI::editor_load(const std::string &rel, bool keep_position)
 	if (lines_.empty()) lines_.push_back("");
 	if (keep_position) {
 		cy_ = std::min(old_cy, editor_line_count() - 1);
-		cx_ = 0;
-		/* The saved line may have different UTF-8 cluster boundaries. */
-		while (cx_ < (int)lines_[cy_].size()) {
-			int next = (int)next_cluster(lines_[cy_], (size_t)cx_);
-			if (next > old_cx) break;
-			cx_ = next;
-		}
+		if (cy_ < 0)
+			cy_ = 0;
+		const std::string &ln = lines_[cy_];
+		int len = (int)ln.size();
+		if (old_cx <= 0)
+			cx_ = 0;
+		else if (old_cx >= len)
+			cx_ = len;
+		else
+			cx_ = (int)prev_cluster(ln, (size_t)old_cx);
 	} else {
 		cy_ = cx_ = etop_ = 0;
 		status_.clear();
 	}
 	goal_col_ = -1;
 	editor_invalidate_wrap();
+	editor_sync_wrap();
+	editor_rebuild_disp_all();
+	if (keep_position)
+		editor_remember_goal();
 	dirty_ = false;
 	return true;
 }
@@ -3325,9 +3515,11 @@ void UI::leave_editor()
  * can travel up/down between the reserved end-of-visual-line positions) */
 void UI::editor_remember_goal()
 {
-	int w = editor_text_w();
+	editor_sync_wrap();
 	int chunk = 0, col = 0;
-	cursor_chunk_edit(lines_[cy_], cx_, w, chunk, col);
+	if (cy_ >= 0 && cy_ < (int)editor_wrap_.size())
+		cursor_chunk_from_chunks(lines_[cy_], cx_, editor_wrap_[cy_], chunk,
+		                         col);
 	goal_col_ = col;
 }
 
@@ -3455,14 +3647,15 @@ void UI::handle_editor(const KeyEvent &ev)
 		editor_after_lines_change(cy_ - 1, true);
 		break;
 	}
-	case Key::Char:
+	case Key::Char: {
 		if (!editor_begin_change()) break;
-		lines_[cy_].insert(cx_, ev.text);
+		std::string ins = ev.text;
+		editor_drain_paste(ins);
 		goal_col_ = -1;
-		cx_ += (int)ev.text.size();
 		dirty_ = true;
-		editor_after_lines_change(cy_, false);
+		editor_insert_text(ins);
 		break;
+	}
 	case Key::CtrlS: editor_save(); break;
 	case Key::CtrlG: open_prompt(5, "goto line: ", ""); break;
 	case Key::Esc: case Key::CtrlC:
@@ -3920,10 +4113,11 @@ void UI::run(ssh_channel ch, int cols, int rows)
 			if (get_version() != seen_version_) {
 				seen_version_ = get_version();
 				process_events();
-				if (content_view() == EDITOR && !dirty_ &&
-				    !editor_load(edit_rel_, true)) {
-					leave_editor();
-					status_ = "the open file was deleted or cannot be read";
+				if (content_view() == EDITOR && !dirty_) {
+					if (!editor_load(edit_rel_, true)) {
+						leave_editor();
+						status_ = "the open file was deleted or cannot be read";
+					}
 				}
 				if (mode_ != EDITOR) refresh();
 			}
