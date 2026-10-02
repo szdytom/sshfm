@@ -16,9 +16,17 @@ concurrency:
 
 jobs:
   build:
-    name: Linux x86-64
-    runs-on: ubuntu-24.04
+    name: Linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm64
+            arch: arm64
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -39,7 +47,18 @@ jobs:
         run: |
           test -x out/sshfm
           file out/sshfm
-          readelf -h out/sshfm | grep -q 'Advanced Micro Devices X86-64'
+          case "${{ matrix.arch }}" in
+            x86_64)
+              readelf -h out/sshfm | grep -q 'Advanced Micro Devices X86-64'
+              ;;
+            arm64)
+              readelf -h out/sshfm | grep -q 'AArch64'
+              ;;
+            *)
+              echo "unknown arch: ${{ matrix.arch }}" >&2
+              exit 1
+              ;;
+          esac
           if readelf -l out/sshfm | grep -q INTERP; then
             echo 'Expected a statically linked executable' >&2
             exit 1
@@ -47,13 +66,13 @@ jobs:
           ./out/sshfm --help
 
       - name: Package executable
-        run: tar -czf out/sshfm-linux-x86_64.tar.gz -C out sshfm
+        run: tar -czf "out/sshfm-linux-${{ matrix.arch }}.tar.gz" -C out sshfm
 
       - name: Upload executable
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: sshfm-linux-x86_64
-          path: out/sshfm-linux-x86_64.tar.gz
+          name: sshfm-linux-${{ matrix.arch }}
+          path: out/sshfm-linux-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
           retention-days: 14
 
@@ -61,7 +80,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: sshfm-build-logs
+          name: sshfm-build-logs-${{ matrix.arch }}
           path: ${{ runner.temp }}/sshfm-build/*.log
           if-no-files-found: ignore
           retention-days: 7
