@@ -13,6 +13,7 @@
 # Environment:
 #     SSHFM_WORK   working/cache directory (default: ${TMPDIR:-/tmp}/sshfm-build)
 #     JOBS         parallel make jobs (default: nproc)
+#     SSHFM_ENABLE_LANDLOCK  1 to enable Landlock (default), 0 to disable
 #
 # Requirements (build machine):
 #     g++ (C++17), cmake >= 3.10, make, perl, tar, xz
@@ -27,6 +28,11 @@ OUT="$PKG/out"
 WORK="${SSHFM_WORK:-${TMPDIR:-/tmp}/sshfm-build}"
 PREFIX="$WORK/prefix"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 2)}"
+SSHFM_ENABLE_LANDLOCK="${SSHFM_ENABLE_LANDLOCK:-1}"
+case "$SSHFM_ENABLE_LANDLOCK" in
+0|1) ;;
+*) echo "SSHFM_ENABLE_LANDLOCK must be 0 or 1" >&2; exit 2 ;;
+esac
 
 CLEAN=0
 while [ $# -gt 0 ]; do
@@ -110,6 +116,7 @@ fi
 # ----------------------------------------------------------------- sshfm
 say "sshfm"
 g++ -O2 -std=c++17 -static -Wl,--unresolved-symbols=ignore-all \
+    -DSSHFM_ENABLE_LANDLOCK="$SSHFM_ENABLE_LANDLOCK" \
     -DLIBSSH_STATIC -I"$PREFIX/include" \
     "$SRC/sshfm.cpp" \
     "$PREFIX/lib/libssh.a" "$PREFIX/lib/libcrypto.a" "$PREFIX/lib/libz.a" \

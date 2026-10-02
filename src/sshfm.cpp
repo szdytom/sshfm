@@ -50,6 +50,100 @@
 #include <dirent.h>
 #include <limits.h>
 
+#ifndef SSHFM_ENABLE_LANDLOCK
+#define SSHFM_ENABLE_LANDLOCK 1
+#endif
+
+#if SSHFM_ENABLE_LANDLOCK
+#include <linux/landlock.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+
+/* Apply before accepting clients or creating session threads.  Keys and
+ * libssh configuration are already loaded; only the data tree is needed
+ * afterwards.  Descendant threads inherit this irreversible policy. */
+static bool restrict_server(const std::string &root)
+{
+	int abi = (int)syscall(SYS_landlock_create_ruleset, nullptr, 0,
+	                       LANDLOCK_CREATE_RULESET_VERSION);
+	if (abi < 0) {
+		fprintf(stderr, "sshfm: Landlock ABI query failed: %s\n", strerror(errno));
+		return false;
+	}
+	/* REFER preserves cross-directory moves; TRUNCATE prevents writes outside
+	 * the root through truncate(), which earlier ABIs cannot restrict. */
+	if (abi < 3) {
+		fprintf(stderr, "sshfm: Landlock ABI 3 or newer is required (found %d)\n", abi);
+		return false;
+	}
+
+	const unsigned long long data_access =
+		LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE |
+		LANDLOCK_ACCESS_FS_READ_DIR | LANDLOCK_ACCESS_FS_REMOVE_DIR |
+		LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_MAKE_DIR |
+		LANDLOCK_ACCESS_FS_MAKE_REG | LANDLOCK_ACCESS_FS_REFER |
+		LANDLOCK_ACCESS_FS_TRUNCATE;
+	struct landlock_ruleset_attr ruleset = {};
+	ruleset.handled_access_fs = data_access |
+		LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_MAKE_CHAR |
+		LANDLOCK_ACCESS_FS_MAKE_BLOCK | LANDLOCK_ACCESS_FS_MAKE_SOCK |
+		LANDLOCK_ACCESS_FS_MAKE_FIFO | LANDLOCK_ACCESS_FS_MAKE_SYM;
+#ifdef LANDLOCK_ACCESS_FS_IOCTL_DEV
+	if (abi >= 5)
+		ruleset.handled_access_fs |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+#endif
+	size_t ruleset_size = sizeof(ruleset.handled_access_fs);
+	bool network_restricted = false;
+#ifdef LANDLOCK_ACCESS_NET_BIND_TCP
+	if (abi >= 4) {
+		/* The listening socket already exists.  Accept and replies remain
+		 * allowed, but no new TCP binds or outbound connects are needed. */
+		ruleset.handled_access_net =
+			LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP;
+		ruleset_size += sizeof(ruleset.handled_access_net);
+		network_restricted = true;
+	}
+#endif
+	int ruleset_fd = (int)syscall(SYS_landlock_create_ruleset, &ruleset, ruleset_size, 0);
+	if (ruleset_fd < 0) {
+		fprintf(stderr, "sshfm: Landlock ruleset creation failed: %s\n", strerror(errno));
+		return false;
+	}
+	auto fail = [ruleset_fd](const char *action) {
+		int err = errno;
+		close(ruleset_fd);
+		fprintf(stderr, "sshfm: Landlock %s failed: %s\n", action, strerror(err));
+		return false;
+	};
+	struct landlock_path_beneath_attr path = {};
+	path.allowed_access = data_access;
+	path.parent_fd = open(root.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
+	if (path.parent_fd < 0)
+		return fail("root open");
+	int rc = (int)syscall(SYS_landlock_add_rule, ruleset_fd,
+	                      LANDLOCK_RULE_PATH_BENEATH, &path, 0);
+	int err = errno;
+	close(path.parent_fd);
+	if (rc < 0) {
+		errno = err;
+		return fail("root rule");
+	}
+	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
+		return fail("no_new_privs");
+	if (syscall(SYS_landlock_restrict_self, ruleset_fd, 0) != 0)
+		return fail("enforcement");
+	close(ruleset_fd);
+	fprintf(stderr, "sshfm: Landlock enabled (ABI %d, filesystem%s)\n",
+	        abi, network_restricted ? ", TCP" : "");
+	return true;
+}
+#else
+static bool restrict_server(const std::string &)
+{
+	return true;
+}
+#endif
+
 /* ------------------------------------------------------------------ */
 /* broadcast: any filesystem change bumps a global version             */
 /* ------------------------------------------------------------------ */
@@ -4510,6 +4604,12 @@ int main(int argc, char **argv)
 
 	if (ssh_bind_listen(bind) < 0) {
 		fprintf(stderr, "sshfm: listen failed: %s\n", ssh_get_error(bind));
+		return 1;
+	}
+	if (!restrict_server(g_root)) {
+		ssh_bind_free(bind);
+		ssh_key_free(key);
+		ssh_finalize();
 		return 1;
 	}
 	for (;;) {

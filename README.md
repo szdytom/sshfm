@@ -24,6 +24,9 @@ sshfm/
 │  ├─ zlib-1.3.1.tar.gz
 │  ├─ openssl-3.0.13.tar.gz
 │  └─ libssh-0.12.2.tar.xz
+├─ tests/
+│  ├─ landlock.cpp   # server sandbox regression tests
+│  └─ run-landlock.sh
 └─ out/              # build output (created by build.sh)
    └─ sshfm          # statically linked Linux x86-64 executable
 ```
@@ -32,6 +35,8 @@ sshfm/
 
 - Linux or WSL
 - `g++` (C++17), `cmake` (>= 3.10), `make`, `perl`, `tar`, `xz`
+- Linux userspace headers with Landlock ABI 3 definitions (Linux 6.2 or
+  newer), unless building with Landlock disabled
 
 There are **no runtime** dependencies: the result is a statically linked ELF.
 
@@ -68,6 +73,22 @@ Override with environment variables:
 SSHFM_WORK=/path/to/cache JOBS=8 ./build.sh
 ```
 
+Linux Landlock protection is enabled by default through the compile-time
+macro `SSHFM_ENABLE_LANDLOCK=1`. To build without it:
+
+```bash
+SSHFM_ENABLE_LANDLOCK=0 bash build.sh
+```
+
+When compiling the source directly, use `-DSSHFM_ENABLE_LANDLOCK=0` to
+disable it; an undefined macro defaults to `1`.
+
+After building, run the Landlock regression tests on a supported kernel:
+
+```bash
+bash tests/run-landlock.sh
+```
+
 ## Running
 
 ```bash
@@ -94,6 +115,23 @@ Command line options:
 
 ## Notes
 
+- With Landlock enabled, startup requires a kernel with Landlock enabled
+  and ABI 3 or newer (Linux 6.2+). If sandbox setup fails, the server exits
+  before accepting clients. Host keys, libssh configuration, and the
+  listening socket are initialized before the policy is applied; all
+  session threads inherit it.
+- The Landlock filesystem policy allows reading, writing, creating,
+  deleting, and moving regular files and directories only beneath `-dir`.
+  Execution and creation of devices, sockets, FIFOs, or symlinks are denied.
+  Symlinks that resolve outside the data tree cannot be opened for data
+  access. With ABI 4+ and network-capable build headers, new TCP binds and
+  outbound TCP connections are also denied; the existing SSH listener and
+  its accepted connections keep working. ABI 5+ and corresponding build
+  headers additionally restrict device ioctls.
+- Landlock supplements the application's path checks. It does not restrict
+  every filesystem operation (for example, `stat` and `chmod`), or revoke
+  access through file descriptors opened before enforcement. See the
+  [kernel Landlock documentation](https://docs.kernel.org/6.14/userspace-api/landlock.html).
 - The host key is generated on first run as `sshfm_hostkey` next to the
   executable.
 - Inside the sandbox every entry's real file name carries a `1` prefix, and
