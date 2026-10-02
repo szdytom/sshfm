@@ -16,7 +16,7 @@
 #
 # Requirements (build machine):
 #     g++ (C++17), cmake >= 3.10, make, perl, tar, xz
-#     A Linux / WSL environment.  The result is a static Linux binary for the host CPU.
+#     A Linux / WSL environment.  The result is a static Linux x86-64 binary.
 #
 set -euo pipefail
 
