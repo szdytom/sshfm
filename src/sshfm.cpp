@@ -531,6 +531,11 @@ static std::vector<std::string> u8wrap_edit(const std::string &s, int w)
 	std::vector<std::string> out;
 	if (w < 1)
 		w = 1;
+	/* every logical line gets at least one visual row (including blank lines) */
+	if (s.empty()) {
+		out.push_back("");
+		return out;
+	}
 	size_t pos = 0;
 	while (pos < s.size()) {
 		int limit = editor_chunk_limit(s, pos, w);
@@ -549,6 +554,8 @@ static std::vector<std::string> u8wrap_edit(const std::string &s, int w)
 		out.push_back(cur);
 		pos = i;
 	}
+	if (out.empty())
+		out.push_back("");
 	return out;
 }
 
@@ -569,8 +576,14 @@ static void cursor_chunk_edit(const std::string &s, int cx, int w, int &chunk,
 			return;
 		}
 		if (cx == end) {
-			chunk = c;
-			col = u8width(chunks[c]);
+			/* end of a non-final wrap row: cursor uses the next row, col 0 */
+			if (c + 1 < (int)chunks.size()) {
+				chunk = c + 1;
+				col = 0;
+			} else {
+				chunk = c;
+				col = u8width(chunks[c]);
+			}
 			return;
 		}
 		off = end;
@@ -578,6 +591,9 @@ static void cursor_chunk_edit(const std::string &s, int cx, int w, int &chunk,
 	if (!chunks.empty()) {
 		chunk = (int)chunks.size() - 1;
 		col = u8width(chunks.back());
+	} else {
+		chunk = 0;
+		col = 0;
 	}
 }
 
@@ -595,8 +611,11 @@ static size_t chunk_byte_offset_edit(const std::string &s, int chunk_want,
 		while (i < s.size()) {
 			size_t j = next_cluster(s, i);
 			int clw = cluster_width(s, i, j);
-			if (col + clw > limit && col > 0)
+			if (col + clw > limit && col > 0) {
+				if (chunk == chunk_want && col_want >= col)
+					return i;   /* past this full row -> next row, col 0 */
 				break;
+			}
 			if (chunk > chunk_want)
 				return i;
 			if (chunk == chunk_want && col + clw > col_want)
@@ -604,8 +623,11 @@ static size_t chunk_byte_offset_edit(const std::string &s, int chunk_want,
 			col += clw;
 			i = j;
 		}
-		if (chunk == chunk_want)
+		if (chunk == chunk_want) {
+			if (col_want >= col && i < s.size())
+				return i;       /* goal past end of a full intermediate row */
 			return i;
+		}
 		chunk++;
 		pos = i;
 	}
@@ -2352,8 +2374,13 @@ const std::vector<std::pair<int, int>> &UI::editor_display()
 		return editor_disp_;
 	editor_disp_.clear();
 	for (int li = 0; li < editor_line_count(); li++) {
+		const std::vector<std::string> &chunks = editor_wrap_[li];
+		if (chunks.empty()) {
+			editor_disp_.push_back({li, 0});
+			continue;
+		}
 		size_t off = 0;
-		for (const std::string &chunk : editor_wrap_[li]) {
+		for (const std::string &chunk : chunks) {
 			editor_disp_.push_back({li, (int)off});
 			off += chunk.size();
 		}
