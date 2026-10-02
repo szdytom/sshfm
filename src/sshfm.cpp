@@ -513,11 +513,12 @@ static std::vector<std::string> u8wrap(const std::string &s, int w)
 	return out;
 }
 
-/* Editor wrap within one logical line: intermediate rows use full width `w`;
- * the final row holds at most w-1 columns of text so one column remains for
- * the cursor after the last character.  If the tail would fit in w columns
- * but not w-1, force a break at w-1 (last grapheme(s) move to the next row). */
-static int editor_limit_for_rem(int rem, int w)
+/* Max display columns for the next visual row of a logical line.
+ * rem = display width still to place; clusters_left = grapheme clusters left.
+ * Intermediate rows use w; the final row uses w-1 (room for cursor after text).
+ * If w_last < rem <= w the tail needs a second row — peel to w-1 here only when
+ * more than one cluster remains; a single cluster is never truncated. */
+static int editor_visual_limit(int rem, int w, int clusters_left)
 {
 	if (w < 1)
 		w = 1;
@@ -526,9 +527,11 @@ static int editor_limit_for_rem(int rem, int w)
 		w_last = 1;
 	if (rem <= w_last)
 		return w_last;
-	if (rem <= w)
-		return w_last;
-	return w;
+	if (rem > w)
+		return w;
+	if (clusters_left <= 1)
+		return w;
+	return w_last;
 }
 
 static std::vector<std::string> u8wrap_edit(const std::string &s, int w)
@@ -557,12 +560,16 @@ static std::vector<std::string> u8wrap_edit(const std::string &s, int w)
 		suf[k] = suf[k + 1] + cl[k].cw;
 	int k = 0;
 	while (k < n) {
-		int limit = editor_limit_for_rem(suf[k], w);
+		int limit = editor_visual_limit(suf[k], w, n - k);
 		int cw = 0;
 		int k0 = k;
 		while (k < n) {
 			if (cw + cl[k].cw > limit && cw > 0)
 				break;
+			cw += cl[k].cw;
+			k++;
+		}
+		if (k == k0) {
 			cw += cl[k].cw;
 			k++;
 		}
