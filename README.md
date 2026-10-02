@@ -25,7 +25,7 @@ sshfm/
 │  ├─ openssl-3.0.13.tar.gz
 │  └─ libssh-0.12.2.tar.xz
 └─ out/              # build output (created by build.sh)
-   └─ sshfm          # statically linked Linux x86-64 executable
+   └─ sshfm          # statically linked Linux executable (host CPU)
 ```
 
 ## Build requirements (on the build machine)
@@ -33,7 +33,11 @@ sshfm/
 - Linux or WSL
 - `g++` (C++17), `cmake` (>= 3.10), `make`, `perl`, `tar`, `xz`
 
-There are **no runtime** dependencies: the result is a statically linked ELF.
+There are **no runtime** dependencies: the result is a statically linked ELF
+for the machine you build on (e.g. x86_64 or arm64).
+
+CI builds native **linux/x86_64** and **linux/arm64** binaries; download the
+matching artifact from the workflow run’s Artifacts section.
 
 ## Building
 
