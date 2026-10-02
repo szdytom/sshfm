@@ -80,6 +80,7 @@ struct OnlineGuard {
 /* live directory of every session, for the "<here>" online count */
 static std::mutex g_sess_mtx;
 static std::map<unsigned long long, std::string> g_sessions;
+static std::map<unsigned long long, std::string> g_session_ips; /* sid -> ip */
 static std::atomic<unsigned long long> g_next_sid{0};
 
 /* ---- BEL broadcasts ---- */
@@ -187,6 +188,25 @@ static bool filelock_held_id(const std::string &id)
 		return false;
 	std::lock_guard<std::mutex> lk(g_lock_mtx);
 	return g_filelocks.count(id) > 0;
+}
+
+static bool filelock_owner_id(const std::string &id, unsigned long long &owner)
+{
+	std::lock_guard<std::mutex> lk(g_lock_mtx);
+	auto it = g_filelocks.find(id);
+	if (it == g_filelocks.end())
+		return false;
+	owner = it->second;
+	return true;
+}
+
+static std::string session_ip(unsigned long long sid)
+{
+	std::lock_guard<std::mutex> lk(g_sess_mtx);
+	auto it = g_session_ips.find(sid);
+	if (it == g_session_ips.end())
+		return "?";
+	return it->second;
 }
 
 /* ---- global path events (rename / delete of folders & files) ---- */
@@ -491,6 +511,105 @@ static std::vector<std::string> u8wrap(const std::string &s, int w)
 	}
 	out.push_back(cur);
 	return out;
+}
+
+/* Editor wrap: full width `w` on every visual row except the last row of each
+ * logical line, which uses w-1 so one column remains after the last character. */
+static int editor_chunk_limit(const std::string &s, size_t pos, int w)
+{
+	if (w < 1)
+		w = 1;
+	int w_last = w - 1;
+	if (w_last < 1)
+		w_last = 1;
+	int rem = u8width(s.substr(pos));
+	return (rem <= w_last) ? w_last : w;
+}
+
+static std::vector<std::string> u8wrap_edit(const std::string &s, int w)
+{
+	std::vector<std::string> out;
+	if (w < 1)
+		w = 1;
+	size_t pos = 0;
+	while (pos < s.size()) {
+		int limit = editor_chunk_limit(s, pos, w);
+		std::string cur;
+		int cw = 0;
+		size_t i = pos;
+		while (i < s.size()) {
+			size_t j = next_cluster(s, i);
+			int clw = cluster_width(s, i, j);
+			if (cw + clw > limit && !cur.empty())
+				break;
+			cur.append(s, i, j - i);
+			cw += clw;
+			i = j;
+		}
+		out.push_back(cur);
+		pos = i;
+	}
+	return out;
+}
+
+static void cursor_chunk_edit(const std::string &s, int cx, int w, int &chunk,
+                              int &col)
+{
+	chunk = 0;
+	col = 0;
+	if (w < 1)
+		w = 1;
+	std::vector<std::string> chunks = u8wrap_edit(s, w);
+	int off = 0;
+	for (int c = 0; c < (int)chunks.size(); c++) {
+		int end = off + (int)chunks[c].size();
+		if (cx < end) {
+			chunk = c;
+			col = u8width(s.substr((size_t)off, (size_t)(cx - off)));
+			return;
+		}
+		if (cx == end) {
+			chunk = c;
+			col = u8width(chunks[c]);
+			return;
+		}
+		off = end;
+	}
+	if (!chunks.empty()) {
+		chunk = (int)chunks.size() - 1;
+		col = u8width(chunks.back());
+	}
+}
+
+static size_t chunk_byte_offset_edit(const std::string &s, int chunk_want,
+                                     int col_want, int w)
+{
+	if (w < 1)
+		w = 1;
+	int chunk = 0;
+	size_t pos = 0;
+	while (pos < s.size()) {
+		int limit = editor_chunk_limit(s, pos, w);
+		int col = 0;
+		size_t i = pos;
+		while (i < s.size()) {
+			size_t j = next_cluster(s, i);
+			int clw = cluster_width(s, i, j);
+			if (col + clw > limit && col > 0)
+				break;
+			if (chunk > chunk_want)
+				return i;
+			if (chunk == chunk_want && col + clw > col_want)
+				return i;
+			col += clw;
+			i = j;
+		}
+		if (chunk == chunk_want)
+			return i;
+		chunk++;
+		pos = i;
+	}
+	return s.size();
 }
 
 /* where does byte-offset `cx` land in the wrapped chunks of `s` (width w)?
@@ -992,6 +1111,17 @@ public:
 			m.creator_ip = ip;
 			m.creator_ts = (long long)time(nullptr);
 		}
+		m.editor_ip = ip;
+		m.mtime_ts = (long long)time(nullptr);
+		write_meta(rel, m);
+		touch_ancestors(rel, ip);
+		return true;
+	}
+
+	/* touch sidecar only: editor / mtime, no data-file rewrite */
+	bool touch_editor_meta(const std::string &rel, const std::string &ip)
+	{
+		Meta m = read_meta(rel);
 		m.editor_ip = ip;
 		m.mtime_ts = (long long)time(nullptr);
 		write_meta(rel, m);
@@ -1508,6 +1638,7 @@ private:
 	void cell_widths(const std::vector<int> &cells, int w[6]) const;
 	bool marquee_active() const;
 	std::string title_text() const;
+	std::string editor_lock_holder_ip() const;
 	void draw_scrollbar(std::string &s, int first, int count, int total);
 };
 
@@ -1979,6 +2110,20 @@ bool UI::marquee_active() const
 	return u8width(nm) > w[0];
 }
 
+std::string UI::editor_lock_holder_ip() const
+{
+	if (edit_rel_.empty())
+		return std::string();
+	Meta m = sb_.read_meta(edit_rel_);
+	size_t p = edit_rel_.rfind('/');
+	std::string name = (p == std::string::npos) ? edit_rel_ : edit_rel_.substr(p + 1);
+	std::string lid = filelock_entry_id(m.id, name);
+	unsigned long long owner = 0;
+	if (!filelock_owner_id(lid, owner) || owner == sid_)
+		return std::string();
+	return session_ip(owner);
+}
+
 std::string UI::title_text() const
 {
 	if (mode_ == CAPTCHA) {
@@ -1988,9 +2133,15 @@ std::string UI::title_text() const
 		    ? sfmt(" sshfm  low captcha   time left: %ds", left)
 		    : sfmt(" sshfm  captcha   time left: %ds", left);
 	}
-	if (content_view() == EDITOR)
+	if (content_view() == EDITOR) {
+		std::string by = editor_lock_holder_ip();
+		if (!by.empty())
+			return sfmt(" edit: %s   locked by %s   line %d/%d",
+			            edit_rel_.c_str(), by.c_str(), cy_ + 1,
+			            editor_line_count());
 		return sfmt(" edit: %s   line %d/%d", edit_rel_.c_str(),
 		            cy_ + 1, editor_line_count());
+	}
 	return sfmt(" sshfm  /%s   [%s]   ol %d/%d", cwd_.c_str(), ip_.c_str(),
 	            here_count(), g_online.load());
 }
@@ -2132,7 +2283,7 @@ int UI::editor_text_w() const
 		while (n > 0) { d++; n /= 10; }
 		numw = std::max(3, d) + 1;
 	}
-	int w = main_cols_ - numw - 1;   /* reserve one column for the cursor */
+	int w = main_cols_ - numw;
 	return w < 1 ? 1 : w;
 }
 
@@ -2152,7 +2303,7 @@ void UI::editor_sync_wrap()
 		editor_wrap_w_ = w;
 		editor_wrap_.resize(lines_.size());
 		for (int li = 0; li < editor_line_count(); li++)
-			editor_wrap_[li] = u8wrap(lines_[li], w);
+			editor_wrap_[li] = u8wrap_edit(lines_[li], w);
 		editor_disp_dirty_ = true;
 	}
 }
@@ -2162,7 +2313,7 @@ void UI::editor_touch_line(int li)
 	if (li < 0 || li >= editor_line_count())
 		return;
 	editor_sync_wrap();
-	editor_wrap_[li] = u8wrap(lines_[li], editor_wrap_w_);
+	editor_wrap_[li] = u8wrap_edit(lines_[li], editor_wrap_w_);
 	editor_disp_dirty_ = true;
 }
 
@@ -2189,7 +2340,7 @@ int UI::editor_cursor_display_row() const
 	for (int li = 0; li < cy_; li++)
 		d += (int)editor_wrap_[li].size();
 	int chunk = 0, col = 0;
-	cursor_chunk(lines_[cy_], cx_, w, chunk, col);
+	cursor_chunk_edit(lines_[cy_], cx_, w, chunk, col);
 	(void)col;
 	return d + chunk;
 }
@@ -2239,6 +2390,7 @@ void UI::draw_editor(std::string &s)
 		for (int k = 0; k < (int)disp.size(); k++)
 			if (disp[k].first == anchor_logical_) { etop_ = k; break; }
 		last_w_ = w;
+		editor_remember_goal();
 	}
 
 	/* cursor display row (must match cursor_chunk / render()) */
@@ -2506,10 +2658,10 @@ void UI::render()
 	} else if (cv == EDITOR) {
 		editor_sync_wrap();
 		int w = editor_text_w();
-		int numw = main_cols_ - w - 1;   /* w = main_cols_ - numw - 1 */
+		int numw = main_cols_ - w;
 		int cdisp = editor_cursor_display_row();
 		int chunk = 0, col = 0;
-		cursor_chunk(lines_[cy_], cx_, w, chunk, col);
+		cursor_chunk_edit(lines_[cy_], cx_, w, chunk, col);
 		(void)chunk;
 		int ccol = numw + col;
 		if (ccol < 0) ccol = 0;
@@ -3102,7 +3254,12 @@ bool UI::editor_begin_change()
 
 void UI::editor_save()
 {
-	if (!dirty_) { status_ = "no changes to save"; return; }
+	if (!dirty_) {
+		status_ = sb_.touch_editor_meta(edit_rel_, ip_) ? "updated" : "update failed";
+		if (status_ == "updated")
+			bump_version();
+		return;
+	}
 	std::string data;
 	for (size_t i = 0; i < lines_.size(); i++) {
 		data += lines_[i];
@@ -3141,13 +3298,19 @@ void UI::editor_remember_goal()
 {
 	int w = editor_text_w();
 	int chunk = 0, col = 0;
-	cursor_chunk(lines_[cy_], cx_, w, chunk, col);
+	cursor_chunk_edit(lines_[cy_], cx_, w, chunk, col);
 	goal_col_ = col;
 }
 
 void UI::handle_editor(const KeyEvent &ev)
 {
 	switch (ev.key) {
+	case Key::Resize:
+		layout();
+		editor_invalidate_wrap();
+		editor_sync_wrap();
+		editor_remember_goal();
+		break;
 	case Key::Up:
 	case Key::Down:
 	case Key::PageUp:
@@ -3204,7 +3367,7 @@ void UI::handle_editor(const KeyEvent &ev)
 			break;
 		}
 		cy_ = tl;
-		cx_ = (int)chunk_byte_offset(lines_[cy_], tc, col, w);
+		cx_ = (int)chunk_byte_offset_edit(lines_[cy_], tc, col, w);
 		break;
 	}
 	case Key::Left:
@@ -3645,6 +3808,7 @@ void UI::run(ssh_channel ch, int cols, int rows)
 		/* a captcha session belongs to no directory yet */
 		g_sessions[sid_] = (g_captcha_timeout > 0) ? std::string("\x01" "captcha")
 		                                           : cwd_;
+		g_session_ips[sid_] = ip_;
 	}
 	g_online_epoch++;   /* our "here" group gained a member */
 	/* non-blocking so ssh_message_get() (resize polling) never stalls the
@@ -3759,6 +3923,7 @@ void UI::run(ssh_channel ch, int cols, int rows)
 	{
 		std::lock_guard<std::mutex> lk(g_sess_mtx);
 		g_sessions.erase(sid_);
+		g_session_ips.erase(sid_);
 	}
 	std::string bye = "\x1b[?25h\x1b[2J\x1b[H"
 	                  "Disconnect from sshfm.\r\nSee you.\r\n";
