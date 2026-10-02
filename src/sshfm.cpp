@@ -573,7 +573,8 @@ static std::vector<std::string> u8wrap_edit(const std::string &s, int w)
 			cw += cl[k].cw;
 			k++;
 		}
-		out.push_back(s.substr(cl[k0].b, cl[k].b - cl[k0].b));
+		size_t chunk_end = (k < n) ? cl[k].b : s.size();
+		out.push_back(s.substr(cl[k0].b, chunk_end - cl[k0].b));
 	}
 	if (out.empty())
 		out.push_back("");
