@@ -377,6 +377,29 @@ static size_t prev_cluster(const std::string &s, size_t i)
 	return prev;
 }
 
+/* Nearest valid byte cursor on a line (0, each cluster start, and len). */
+static int editor_snap_cx(const std::string &ln, int want)
+{
+	int len = (int)ln.size();
+	if (len == 0 || want <= 0)
+		return 0;
+	if (want >= len)
+		return len;
+	size_t best = 0;
+	int best_d = want;
+	for (size_t p = 0; p <= (size_t)len; ) {
+		int d = std::abs(want - (int)p);
+		if (d < best_d) {
+			best_d = d;
+			best = p;
+		}
+		if (p == (size_t)len)
+			break;
+		p = next_cluster(ln, p);
+	}
+	return (int)best;
+}
+
 /* ---- control bytes ----------------------------------------------------
  * A raw control byte in a name or in file content is never sent to the
  * terminal as-is; it is shown as visible text in bright black, in standard
@@ -3435,14 +3458,7 @@ bool UI::editor_load(const std::string &rel, bool keep_position)
 		cy_ = std::min(old_cy, editor_line_count() - 1);
 		if (cy_ < 0)
 			cy_ = 0;
-		const std::string &ln = lines_[cy_];
-		int len = (int)ln.size();
-		if (old_cx <= 0)
-			cx_ = 0;
-		else if (old_cx >= len)
-			cx_ = len;
-		else
-			cx_ = (int)prev_cluster(ln, (size_t)old_cx);
+		cx_ = editor_snap_cx(lines_[cy_], old_cx);
 	} else {
 		cy_ = cx_ = etop_ = 0;
 		status_.clear();
